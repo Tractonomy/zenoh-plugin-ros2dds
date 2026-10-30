@@ -26,6 +26,7 @@ publish = false
 [features]
 dds_shm = ["zenoh-plugin-ros2dds/dds_shm"]
 prefix_symbols = ["zenoh-plugin-ros2dds/prefix_symbols"]
+test_hooks = ["zenoh-plugin-ros2dds/test_hooks"]
 shared-memory = ["zenoh/shared-memory"]
 
 [dependencies]

@@ -30,6 +30,7 @@ use zenoh::{
     internal::buffers::{Buffer, ZBuf, ZSlice},
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
+    matching::MatchingListener,
     query::{Querier, Reply},
     sample::Locality,
     Wait,
@@ -66,6 +67,13 @@ pub struct RouteServiceCli {
     context: Context,
     #[serde(skip)]
     _zenoh_querier: Arc<Querier<'static>>,
+    // the listener activating/deactivating the DDS Reader/Writer, scoped to the route (not background):
+    // a background listener outlives the route and recreates orphan DDS entities after its removal
+    #[serde(skip)]
+    matching_listener: Option<MatchingListener<()>>,
+    // false once the route is dropped: a matching callback still running must not leave DDS entities behind
+    #[serde(skip)]
+    alive: Arc<AtomicBool>,
     #[serde(serialize_with = "crate::config::serialize_duration_as_f32")]
     queries_timeout: Duration,
     // the local DDS Reader receiving client's requests and routing them to Zenoh
@@ -85,6 +93,10 @@ pub struct RouteServiceCli {
 
 impl Drop for RouteServiceCli {
     fn drop(&mut self) {
+        // stop the matching callbacks before deleting the DDS entities; a callback already
+        // running sees alive==false and deletes the entities it may have just created
+        self.alive.store(false, Ordering::SeqCst);
+        self.matching_listener.take();
         self.deactivate();
     }
 }
@@ -130,11 +142,13 @@ impl RouteServiceCli {
         // (copy/move all required args for the callback)
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let alive = Arc::new(AtomicBool::new(true));
 
-        zenoh_querier
+        let matching_listener = zenoh_querier
             .matching_listener()
             .callback({
                 let rep_writer = rep_writer.clone();
+                let alive = alive.clone();
                 let req_reader = req_reader.clone();
                 let ros2_name = ros2_name.clone();
                 let ros2_type = ros2_type.clone();
@@ -143,6 +157,9 @@ impl RouteServiceCli {
 
                 move |status| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                        if !alive.load(Ordering::SeqCst) {
+                            return;
+                        }
                         if status.matching() {
                             if let Err(e) = activate(
                                 &rep_writer,
@@ -156,6 +173,15 @@ impl RouteServiceCli {
                             ) {
                                 tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
                             }
+                            // the route was dropped while the entities were created: delete them
+                            if !alive.load(Ordering::SeqCst) {
+                                deactivate(
+                                    &rep_writer,
+                                    &req_reader,
+                                    &route_id,
+                                    &context.ros_discovery_mgr,
+                                )
+                            }
                         } else {
                             deactivate(
                                 &rep_writer,
@@ -166,7 +192,6 @@ impl RouteServiceCli {
                         }
                 }
             })
-            .background()
             .await
             .map_err(|e| format!("Route Service Client (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr}): failed to listen of matching status changes: {e}",))?;
 
@@ -176,6 +201,8 @@ impl RouteServiceCli {
             zenoh_key_expr,
             context,
             _zenoh_querier: zenoh_querier,
+            matching_listener: Some(matching_listener),
+            alive,
             queries_timeout,
             rep_writer,
             req_reader,
@@ -320,7 +347,7 @@ fn activate(
         true,
         qos.clone(),
     )?;
-    let old = rep_writer.swap(dds_writer, Ordering::Relaxed);
+    let old = rep_writer.swap(dds_writer, Ordering::SeqCst);
     if old != DDS_ENTITY_NULL {
         tracing::warn!(
             "{route_id}: on activation their was already a DDS Reply Writer - overwrite it"
@@ -352,7 +379,7 @@ fn activate(
             route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
         },
     )?;
-    let old = req_reader.swap(dds_reader, Ordering::Relaxed);
+    let old = req_reader.swap(dds_reader, Ordering::SeqCst);
     if old != DDS_ENTITY_NULL {
         tracing::warn!(
             "{route_id}: on activation their was already a DDS Request Reader - overwrite it"
@@ -377,7 +404,7 @@ fn deactivate(
     ros_discovery_mgr: &Arc<RosDiscoveryInfoMgr>,
 ) {
     tracing::debug!("{route_id}: Deactivate");
-    let req_reader = req_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+    let req_reader = req_reader.swap(DDS_ENTITY_NULL, Ordering::SeqCst);
     if req_reader != DDS_ENTITY_NULL {
         // remove reader's GID from ros_discovery_info message
         match get_guid(&req_reader) {
@@ -388,7 +415,7 @@ fn deactivate(
             tracing::warn!("{route_id}: error deleting DDS Reader: {e}");
         }
     }
-    let rep_writer = rep_writer.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+    let rep_writer = rep_writer.swap(DDS_ENTITY_NULL, Ordering::SeqCst);
     if rep_writer != DDS_ENTITY_NULL {
         // remove writer's GID from ros_discovery_info message
         match get_guid(&rep_writer) {

@@ -32,6 +32,8 @@ stats = ["zenoh/stats"]
 dynamic_plugin = []
 dds_shm = ["cyclors/iceoryx"]
 prefix_symbols = ["cyclors/prefix_symbols"]
+# test only: fault injection used by tools/atrs1586 (never enable in a release build)
+test_hooks = []
 
 [dependencies]
 async-trait = { workspace = true }
